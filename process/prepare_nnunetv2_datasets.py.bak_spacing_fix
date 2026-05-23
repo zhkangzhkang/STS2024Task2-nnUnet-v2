@@ -1,0 +1,359 @@
+#!/usr/bin/env python3
+"""Prepare STS 2024 tooth CBCT data for nnU-Net v2.
+
+The original project used nnU-Net v1 Task folders and several hard-coded local
+paths. This script creates two nnU-Net v2 datasets instead:
+
+* Dataset313_STS2024_ToothQuadrants: full-volume quadrant segmentation.
+* Dataset312_STS2024_QuadrantTeeth: cropped quadrant tooth segmentation.
+
+Pseudo labels can be added later with --pseudo-label-dir to build student
+datasets for semi-supervised iterations.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import shutil
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable
+
+import numpy as np
+import SimpleITK as sitk
+
+
+NII_GZ = ".nii.gz"
+
+SEQUENTIAL_QUADRANTS = {
+    1: (1, 8),
+    2: (9, 16),
+    3: (17, 24),
+    4: (25, 32),
+}
+
+FDI_QUADRANTS = {
+    1: (11, 18),
+    2: (21, 28),
+    3: (31, 38),
+    4: (41, 48),
+}
+
+
+@dataclass(frozen=True)
+class CasePair:
+    case_id: str
+    image: Path
+    mask: Path
+    source: str
+
+
+def strip_nii_suffix(path: Path | str) -> str:
+    name = Path(path).name
+    if name.endswith(".nii.gz"):
+        return name[:-7]
+    if name.endswith(".nii"):
+        return name[:-4]
+    return Path(name).stem
+
+
+def normalize_case_id(case_id: str) -> str:
+    if case_id.endswith("_0000"):
+        case_id = case_id[:-5]
+    if case_id.endswith("_Mask"):
+        case_id = case_id[:-5]
+    return case_id
+
+
+def dataset_dir(raw_root: Path, dataset_id: int, name: str) -> Path:
+    return raw_root / f"Dataset{dataset_id:03d}_{name}"
+
+
+def make_clean_dir(path: Path, overwrite: bool) -> None:
+    if path.exists():
+        if not overwrite:
+            raise FileExistsError(f"{path} already exists. Pass --overwrite to recreate it.")
+        shutil.rmtree(path)
+    path.mkdir(parents=True, exist_ok=True)
+
+
+def copy_image(src: Path, dst_images_dir: Path, case_id: str) -> None:
+    if not src.name.endswith(NII_GZ):
+        raise ValueError(f"Only .nii.gz inputs are supported by this project pipeline: {src}")
+    dst = dst_images_dir / f"{case_id}_0000.nii.gz"
+    shutil.copy2(src, dst)
+
+
+def write_dataset_json(
+    dataset_path: Path,
+    labels: dict[str, int],
+    num_training: int,
+    description: str,
+) -> None:
+    payload = {
+        "channel_names": {"0": "CT"},
+        "labels": labels,
+        "numTraining": num_training,
+        "file_ending": ".nii.gz",
+        "overwrite_image_reader_writer": "SimpleITKIO",
+        "description": description,
+    }
+    with (dataset_path / "dataset.json").open("w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+
+
+def find_mask(mask_dir: Path, image_case_id: str) -> Path | None:
+    candidates = [
+        mask_dir / f"{image_case_id}_Mask.nii.gz",
+        mask_dir / f"{image_case_id}.nii.gz",
+        mask_dir / f"{image_case_id}_mask.nii.gz",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+
+    matches = sorted(mask_dir.glob(f"{image_case_id}*Mask.nii.gz"))
+    if matches:
+        return matches[0]
+    return None
+
+
+def collect_case_pairs(image_dir: Path, mask_dir: Path, source: str) -> list[CasePair]:
+    if not image_dir.exists():
+        raise FileNotFoundError(f"Image directory does not exist: {image_dir}")
+    if not mask_dir.exists():
+        raise FileNotFoundError(f"Mask directory does not exist: {mask_dir}")
+
+    pairs: list[CasePair] = []
+    for image in sorted(image_dir.glob("*.nii.gz")):
+        case_id = normalize_case_id(strip_nii_suffix(image))
+        mask = find_mask(mask_dir, case_id)
+        if mask is None:
+            raise FileNotFoundError(f"No mask found for image {image.name} in {mask_dir}")
+        pairs.append(CasePair(case_id=case_id, image=image, mask=mask, source=source))
+    return pairs
+
+
+def read_mask_array(mask_path: Path) -> tuple[sitk.Image, np.ndarray]:
+    mask = sitk.ReadImage(str(mask_path))
+    array = sitk.GetArrayFromImage(mask)
+    if not np.issubdtype(array.dtype, np.integer):
+        array = np.rint(array).astype(np.int32)
+    return mask, array
+
+
+def detect_label_scheme(mask_paths: Iterable[Path]) -> str:
+    observed: set[int] = set()
+    for mask_path in mask_paths:
+        _, mask_array = read_mask_array(mask_path)
+        labels = np.unique(mask_array)
+        observed.update(int(v) for v in labels if int(v) != 0)
+        if any(v > 32 for v in observed):
+            return "fdi"
+    return "sequential"
+
+
+def quadrant_ranges(label_scheme: str) -> dict[int, tuple[int, int]]:
+    if label_scheme == "sequential":
+        return SEQUENTIAL_QUADRANTS
+    if label_scheme == "fdi":
+        return FDI_QUADRANTS
+    raise ValueError(f"Unsupported label scheme: {label_scheme}")
+
+
+def remap_to_quadrants(mask_array: np.ndarray, label_scheme: str) -> np.ndarray:
+    remapped = np.zeros(mask_array.shape, dtype=np.uint8)
+    for quadrant, (start, end) in quadrant_ranges(label_scheme).items():
+        remapped[(mask_array >= start) & (mask_array <= end)] = quadrant
+    return remapped
+
+
+def remap_to_quadrant_teeth(
+    roi_mask: np.ndarray,
+    quadrant: int,
+    label_scheme: str,
+    other_tooth_label: int = 9,
+) -> np.ndarray:
+    remapped = np.zeros(roi_mask.shape, dtype=np.uint8)
+    start, end = quadrant_ranges(label_scheme)[quadrant]
+    current = (roi_mask >= start) & (roi_mask <= end)
+    remapped[current] = roi_mask[current].astype(np.int32) - start + 1
+    remapped[(roi_mask > 0) & ~current] = other_tooth_label
+    return remapped
+
+
+def write_like(reference: sitk.Image, array: np.ndarray, dst: Path) -> None:
+    image = sitk.GetImageFromArray(array)
+    image.CopyInformation(reference)
+    sitk.WriteImage(image, str(dst))
+
+
+def prepare_quadrant_dataset(
+    cases: list[CasePair],
+    dataset_path: Path,
+    label_scheme: str,
+    overwrite: bool,
+) -> None:
+    make_clean_dir(dataset_path, overwrite)
+    images_tr = dataset_path / "imagesTr"
+    labels_tr = dataset_path / "labelsTr"
+    images_tr.mkdir()
+    labels_tr.mkdir()
+
+    for case in cases:
+        copy_image(case.image, images_tr, case.case_id)
+        mask, mask_array = read_mask_array(case.mask)
+        quadrant_array = remap_to_quadrants(mask_array, label_scheme)
+        write_like(mask, quadrant_array, labels_tr / f"{case.case_id}.nii.gz")
+
+    write_dataset_json(
+        dataset_path,
+        labels={
+            "background": 0,
+            "quadrant_1": 1,
+            "quadrant_2": 2,
+            "quadrant_3": 3,
+            "quadrant_4": 4,
+        },
+        num_training=len(cases),
+        description=f"STS 2024 full-volume quadrant segmentation ({label_scheme} labels remapped to 1..4).",
+    )
+
+
+def crop_origin_from_array_index(image: sitk.Image, bbox_min_zyx: np.ndarray) -> tuple[float, float, float]:
+    z_min, y_min, x_min = [int(v) for v in bbox_min_zyx]
+    return image.TransformIndexToPhysicalPoint((x_min, y_min, z_min))
+
+
+def prepare_tooth_dataset(
+    cases: list[CasePair],
+    dataset_path: Path,
+    label_scheme: str,
+    overwrite: bool,
+    padding: int,
+) -> None:
+    make_clean_dir(dataset_path, overwrite)
+    images_tr = dataset_path / "imagesTr"
+    labels_tr = dataset_path / "labelsTr"
+    images_tr.mkdir()
+    labels_tr.mkdir()
+
+    written = 0
+    for case in cases:
+        image = sitk.ReadImage(str(case.image))
+        mask, mask_array = read_mask_array(case.mask)
+        image_array = sitk.GetArrayFromImage(image)
+
+        for quadrant, (start, end) in quadrant_ranges(label_scheme).items():
+            coords = np.where((mask_array >= start) & (mask_array <= end))
+            if len(coords[0]) == 0:
+                print(f"[WARN] {case.case_id}: no voxels found for quadrant {quadrant}; skipped")
+                continue
+
+            bbox_min = np.maximum(np.min(coords, axis=1) - padding, 0)
+            bbox_max = np.minimum(np.max(coords, axis=1) + padding + 1, np.array(mask_array.shape))
+            slices = tuple(slice(int(lo), int(hi)) for lo, hi in zip(bbox_min, bbox_max))
+
+            roi_image = image_array[slices]
+            roi_mask = mask_array[slices]
+            remapped_mask = remap_to_quadrant_teeth(roi_mask, quadrant, label_scheme)
+
+            out_case_id = f"{case.case_id}_q{quadrant}"
+            out_image = sitk.GetImageFromArray(roi_image)
+            out_image.SetSpacing(image.GetSpacing())
+            out_image.SetDirection(image.GetDirection())
+            out_image.SetOrigin(crop_origin_from_array_index(image, bbox_min))
+
+            out_mask = sitk.GetImageFromArray(remapped_mask)
+            out_mask.CopyInformation(out_image)
+
+            sitk.WriteImage(out_image, str(images_tr / f"{out_case_id}_0000.nii.gz"))
+            sitk.WriteImage(out_mask, str(labels_tr / f"{out_case_id}.nii.gz"))
+            written += 1
+
+    write_dataset_json(
+        dataset_path,
+        labels={
+            "background": 0,
+            "tooth_1": 1,
+            "tooth_2": 2,
+            "tooth_3": 3,
+            "tooth_4": 4,
+            "tooth_5": 5,
+            "tooth_6": 6,
+            "tooth_7": 7,
+            "tooth_8": 8,
+            "other_tooth": 9,
+        },
+        num_training=written,
+        description=f"STS 2024 quadrant-cropped tooth segmentation ({label_scheme} source labels).",
+    )
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--data-root", type=Path, default=Path("data"))
+    parser.add_argument(
+        "--nnunet-raw",
+        type=Path,
+        default=None,
+        help="nnUNet_raw path. Defaults to $nnUNet_raw if set, otherwise ./nnUNet_raw.",
+    )
+    parser.add_argument("--quadrant-dataset-id", type=int, default=313)
+    parser.add_argument("--tooth-dataset-id", type=int, default=312)
+    parser.add_argument("--quadrant-dataset-name", default="STS2024_ToothQuadrants")
+    parser.add_argument("--tooth-dataset-name", default="STS2024_QuadrantTeeth")
+    parser.add_argument(
+        "--label-scheme",
+        choices=["auto", "sequential", "fdi"],
+        default="auto",
+        help="Original mask label scheme. auto uses fdi when labels > 32 are observed.",
+    )
+    parser.add_argument("--padding", type=int, default=2, help="Voxel padding around each quadrant crop.")
+    parser.add_argument("--pseudo-image-dir", type=Path, default=None)
+    parser.add_argument("--pseudo-label-dir", type=Path, default=None)
+    parser.add_argument("--overwrite", action="store_true")
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    raw_root = args.nnunet_raw
+    if raw_root is None:
+        import os
+
+        raw_root = Path(os.environ.get("nnUNet_raw", "nnUNet_raw"))
+
+    labeled_image_dir = args.data_root / "Train-Labeled" / "Images"
+    labeled_mask_dir = args.data_root / "Train-Labeled" / "Masks"
+    cases = collect_case_pairs(labeled_image_dir, labeled_mask_dir, source="labeled")
+
+    if args.pseudo_label_dir is not None:
+        pseudo_image_dir = args.pseudo_image_dir or (args.data_root / "Train-Unlabeled")
+        pseudo_cases = collect_case_pairs(pseudo_image_dir, args.pseudo_label_dir, source="pseudo")
+        cases.extend(pseudo_cases)
+        print(f"[INFO] Added {len(pseudo_cases)} pseudo-labeled cases from {args.pseudo_label_dir}")
+
+    if not cases:
+        raise RuntimeError("No training cases were found.")
+
+    label_scheme = args.label_scheme
+    if label_scheme == "auto":
+        label_scheme = detect_label_scheme(case.mask for case in cases)
+    print(f"[INFO] Preparing {len(cases)} cases with label_scheme={label_scheme}")
+
+    raw_root.mkdir(parents=True, exist_ok=True)
+    quadrant_path = dataset_dir(raw_root, args.quadrant_dataset_id, args.quadrant_dataset_name)
+    tooth_path = dataset_dir(raw_root, args.tooth_dataset_id, args.tooth_dataset_name)
+
+    prepare_quadrant_dataset(cases, quadrant_path, label_scheme, args.overwrite)
+    prepare_tooth_dataset(cases, tooth_path, label_scheme, args.overwrite, args.padding)
+
+    print(f"[DONE] Wrote quadrant dataset: {quadrant_path}")
+    print(f"[DONE] Wrote tooth dataset: {tooth_path}")
+
+
+if __name__ == "__main__":
+    main()

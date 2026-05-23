@@ -1,0 +1,38 @@
+# Data and generated experiment artifacts
+data/
+output/
+nnunet_work/
+runs/
+logs/
+
+# nnU-Net / model outputs
+*.pth
+*.model
+*.npz
+*.pkl
+*.npy
+
+# Medical image data can be large/private
+*.nii
+*.nii.gz
+
+# Python caches and virtual environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Local shell/session files
+*.log
+*.out
+*.err
