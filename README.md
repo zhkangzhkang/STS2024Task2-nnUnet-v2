@@ -1,69 +1,83 @@
-# STS 2024 Task 2 牙齿 CBCT 半监督实例分割训练指南（nnU-Net v2）
+# STS2024 Task 2 牙齿 CBCT 半监督实例分割复现指南（nnU-Net v2）
 
-本项目用于牙齿 CBCT 图像半监督实例分割。当前代码已经迁移到 **nnU-Net v2**，不再使用 nnU-Net v1 的 `TaskXXX`、`nnUNet_train`、`nnUNet_predict`。
+本项目用于牙齿 CBCT 图像的半监督实例分割。代码已经迁移到 **nnU-Net v2**，不再使用 nnU-Net v1 的 `TaskXXX`、`nnUNet_train`、`nnUNet_predict`。
 
-本文档按“刚入门也能照着做”的方式整理，从服务器环境创建、Miniconda 安装、PyTorch 安装、数据检查、nnU-Net v2 数据准备、预处理、训练、推理到半监督伪标签迭代，完整记录一套推荐流程。
+本文档只保留复现实验所需的正确主流程：环境安装、数据准备、nnU-Net v2 数据集生成、预处理、五折训练、测试集推理、Dice/HD95 评价、无标签伪标签推理。按顺序执行即可复现当前项目的主要结果。
 
-官方参考：
-
-- nnU-Net v2: https://github.com/MIC-DKFZ/nnUNet
-- nnU-Net v2 数据格式: https://github.com/MIC-DKFZ/nnUNet/blob/master/documentation/dataset_format.md
-
-## 1. 项目流程总览
+## 1. 最终推荐方案
 
 本项目采用两阶段分割：
 
 ```text
-原始 CBCT 图像
-  -> 阶段 1：全图象限分割，预测 4 个牙齿象限
-  -> 根据象限预测裁剪 4 个局部 ROI
-  -> 阶段 2：象限内牙齿实例分割，预测局部牙齿 1..8
-  -> 将 4 个象限结果合并回原图空间
-  -> 后处理去除小连通域
+CBCT 原图
+  -> 阶段 1：四象限分割，得到 1、2、3、4 四个牙齿象限
+  -> 根据四象限预测裁剪 4 个局部 ROI
+  -> 阶段 2：在每个象限 ROI 内做牙齿实例分割
+  -> 合并 4 个象限的局部实例预测，恢复到原图空间
+  -> 去除小连通域，得到最终 FDI 牙齿实例标签
 ```
 
-训练时会生成两个 nnU-Net v2 数据集：
+最终主模型：
 
-- `Dataset313_STS2024_ToothQuadrants`：全图象限分割，标签为 `0..4`。
-- `Dataset312_STS2024_QuadrantTeeth`：象限 crop 后的牙齿分割，标签为 `0..9`，其中 `1..8` 是当前象限内牙齿，`9` 是其他象限牙齿。
+```text
+四象限模型：Dataset423，3d_lowres，5-fold ensemble
+牙齿实例模型：Dataset412，3d_fullres，5-fold ensemble
+推理策略：checkpoint_final.pth + TTA
+输出标签：标准 FDI 标签，11-18、21-28、31-38、41-48
+```
 
-半监督迭代时会额外生成学生数据集，默认编号：
+当前测试集结果：
 
-- `Dataset323_STS2024_ToothQuadrants`
-- `Dataset322_STS2024_QuadrantTeeth`
+```text
+Test cases: 50
+Instance-level mean Dice: 0.9562
+Instance-level mean HD95: 0.5754 mm
+Foreground Dice: 0.9684
+Foreground HD95: 0.2645 mm
+```
 
-## 2. 服务器硬件检查
+`checkpoint_best.pth + TTA` 也可作为对照：
 
-登录服务器后先检查 GPU、Python、Conda、磁盘：
+```text
+Instance-level mean Dice: 0.9247
+Instance-level mean HD95: 1.5498 mm
+Foreground Dice: 0.9677
+Foreground HD95: 0.2686 mm
+```
+
+因此论文主结果建议使用 `checkpoint_final.pth + TTA`。
+
+## 2. 服务器环境
+
+当前项目验证过的环境示例：
+
+```text
+GPU: NVIDIA GeForce RTX 4090
+Driver: 580.126.09
+Python: 3.10
+PyTorch: 2.4.0+cu121
+nnU-Net v2: 2.7.0
+```
+
+先检查服务器：
 
 ```bash
 nvidia-smi
-python --version
-conda --version
 pwd
 df -h
 ```
 
-本项目当前验证过的服务器环境示例：
-
-```text
-GPU: 8 x NVIDIA GeForce RTX 4090
-Driver: 580.126.09
-CUDA shown by nvidia-smi: 13.0
-Disk: /data1 has several TB free
-```
-
-注意：`nvidia-smi` 显示的 CUDA 版本是驱动支持的最高版本，不代表 PyTorch 必须安装相同 CUDA 版本。我们实际使用的是 PyTorch `2.4.0+cu121`，已经验证能正常识别 8 张 4090。
+`nvidia-smi` 显示的 CUDA 版本是驱动支持的最高版本，不要求 PyTorch 安装完全相同的 CUDA 版本。当前项目使用 `torch==2.4.0+cu121` 已经验证可用。
 
 ## 3. 安装 Miniconda
 
-如果服务器没有 `conda`，需要先安装 Miniconda。假设你已经把安装包放在：
+如果服务器还没有 conda，先安装 Miniconda。假设安装包在：
 
 ```text
 /data1/Miniconda3-latest-Linux-x86_64.sh
 ```
 
-推荐安装到个人目录：
+安装：
 
 ```bash
 bash /data1/Miniconda3-latest-Linux-x86_64.sh -b -p /data1/zhkang/miniconda3
@@ -76,39 +90,21 @@ source /data1/zhkang/miniconda3/etc/profile.d/conda.sh
 conda --version
 ```
 
-为了以后重新登录也能直接使用 conda：
+写入 `~/.bashrc`：
 
 ```bash
 echo 'source /data1/zhkang/miniconda3/etc/profile.d/conda.sh' >> ~/.bashrc
-```
-
-以后重新登录服务器后，执行：
-
-```bash
 source ~/.bashrc
 ```
 
-## 4. 创建 Python 环境
-
-创建并激活环境：
+## 4. 创建环境并安装依赖
 
 ```bash
 conda create -n nnunetv2 python=3.10 -y
 conda activate nnunetv2
 ```
 
-检查：
-
-```bash
-python --version
-pip --version
-```
-
-建议看到 Python `3.10.x`。
-
-## 5. 安装 PyTorch
-
-当前已验证可用的安装命令：
+安装 PyTorch：
 
 ```bash
 pip install --upgrade pip
@@ -117,55 +113,14 @@ pip install torch==2.4.0 torchvision==0.19.0 torchaudio==2.4.0 \
   --index-url https://download.pytorch.org/whl/cu121
 ```
 
-验证 GPU 是否可用：
-
-```bash
-python - <<'PY'
-import torch
-print("torch:", torch.__version__)
-print("cuda available:", torch.cuda.is_available())
-print("torch cuda:", torch.version.cuda)
-print("gpu count:", torch.cuda.device_count())
-if torch.cuda.is_available():
-    print("gpu 0:", torch.cuda.get_device_name(0))
-PY
-```
-
-理想输出：
-
-```text
-torch: 2.4.0+cu121
-cuda available: True
-torch cuda: 12.1
-gpu count: 8
-gpu 0: NVIDIA GeForce RTX 4090
-```
-
-如果 `cuda available` 是 `False`，先不要继续训练，需要重新检查 PyTorch 安装版本。
-
-## 6. 安装项目依赖
-
-进入项目目录：
+进入项目并安装依赖：
 
 ```bash
 cd ~/STS2024Task2-nnUnet-main
-```
-
-安装依赖：
-
-```bash
 pip install -r requirements-linux.txt
 ```
 
-`requirements-linux.txt` 中包含：
-
-```text
-nnunetv2
-SimpleITK
-numpy
-```
-
-验证 Python 包和命令：
+验证：
 
 ```bash
 python - <<'PY'
@@ -175,7 +130,11 @@ import nnunetv2
 import numpy as np
 
 print("torch:", torch.__version__)
-print("cuda:", torch.cuda.is_available())
+print("cuda available:", torch.cuda.is_available())
+print("torch cuda:", torch.version.cuda)
+print("gpu count:", torch.cuda.device_count())
+if torch.cuda.is_available():
+    print("gpu 0:", torch.cuda.get_device_name(0))
 print("SimpleITK ok")
 print("nnunetv2 ok")
 print("numpy:", np.__version__)
@@ -186,102 +145,111 @@ which nnUNetv2_train
 which nnUNetv2_predict
 ```
 
-能找到三个 `nnUNetv2_*` 命令后，环境就准备好了。
+理想输出包含：
 
-## 7. 上传和检查数据
+```text
+cuda available: True
+gpu count: 大于 0
+```
 
-训练至少需要：
+## 5. 固定 nnU-Net v2 工作目录
+
+推荐把 nnU-Net 的 raw、preprocessed、results 放在大容量磁盘：
+
+```bash
+cat >> ~/.bashrc <<'EOF'
+export NNUNET_BASE="/data1/zhkang/nnunet_work"
+export nnUNet_raw="$NNUNET_BASE/nnUNet_raw"
+export nnUNet_preprocessed="$NNUNET_BASE/nnUNet_preprocessed"
+export nnUNet_results="$NNUNET_BASE/nnUNet_results"
+EOF
+
+source ~/.bashrc
+mkdir -p "$nnUNet_raw" "$nnUNet_preprocessed" "$nnUNet_results"
+```
+
+之后每次进入项目：
+
+```bash
+conda activate nnunetv2
+cd ~/STS2024Task2-nnUnet-main
+```
+
+检查：
+
+```bash
+echo "$nnUNet_raw"
+echo "$nnUNet_preprocessed"
+echo "$nnUNet_results"
+```
+
+## 6. 数据目录结构
+
+项目要求的数据目录：
 
 ```text
 data/
   Train-Labeled/
     Images/*.nii.gz
-    Masks/*_Mask.nii.gz
+    Masks/*.nii.gz
+
   Train-Unlabeled/*.nii.gz
+
   Validation-Public/*.nii.gz
+
+  Manual-Pseudo-Quadrant-Labels/*.nii.gz
+
+  dental_CBCT_test_set/
+    images/*.nii.gz
+    labels/*.nii.gz
 ```
 
-`dental_CBCT_test_set` 不是训练必需目录，后面需要测试集推理或提交结果时再上传即可。
-
-服务器项目目录应类似：
+各目录用途：
 
 ```text
-~/STS2024Task2-nnUnet-main/
-  README.md
-  requirements-linux.txt
-  process/
-  pipeline/
-  scripts/
-  data/
-    Train-Labeled/
-    Train-Unlabeled/
-    Validation-Public/
+Train-Labeled
+  有金标准训练数据。Mask 是 FDI 标签：11-18、21-28、31-38、41-48。
+
+Train-Unlabeled
+  无标签训练数据，用于生成伪标签。
+
+Validation-Public
+  无金标准，只用于可视化检查或比赛提交，不能计算 Dice/HD95。
+
+Manual-Pseudo-Quadrant-Labels
+  手工筛选的四象限伪标签，标签应为 0、1、2、3、4。
+
+dental_CBCT_test_set
+  有金标准测试集，用于论文定量评价和可视化展示。
 ```
 
-统计数量：
+检查数量：
 
 ```bash
 cd ~/STS2024Task2-nnUnet-main
 
-echo "Train images:" && find data/Train-Labeled/Images -name "*.nii.gz" | wc -l
-echo "Train masks:" && find data/Train-Labeled/Masks -name "*.nii.gz" | wc -l
-echo "Unlabeled:" && find data/Train-Unlabeled -name "*.nii.gz" | wc -l
-echo "Validation:" && find data/Validation-Public -name "*.nii.gz" | wc -l
+echo "Train images:"
+find data/Train-Labeled/Images -maxdepth 1 -name "*.nii.gz" | wc -l
+
+echo "Train masks:"
+find data/Train-Labeled/Masks -maxdepth 1 -name "*.nii.gz" | wc -l
+
+echo "Unlabeled:"
+find data/Train-Unlabeled -maxdepth 1 -name "*.nii.gz" | wc -l
+
+echo "Validation:"
+find data/Validation-Public -maxdepth 1 -name "*.nii.gz" | wc -l
+
+echo "Test images:"
+find data/dental_CBCT_test_set/images -maxdepth 1 -name "*.nii.gz" | wc -l
+
+echo "Test labels:"
+find data/dental_CBCT_test_set/labels -maxdepth 1 -name "*.nii.gz" | wc -l
 ```
 
-当前服务器数据示例：
+## 7. 检查训练标签
 
-```text
-Train images: 106
-Train masks: 106
-Unlabeled: 300
-Validation: 20
-```
-
-## 8. 检查图像和标签是否匹配
-
-先检查有标签图像是否都能找到对应 mask：
-
-```bash
-cd ~/STS2024Task2-nnUnet-main
-
-python - <<'PY'
-from pathlib import Path
-
-image_dir = Path("data/Train-Labeled/Images")
-mask_dir = Path("data/Train-Labeled/Masks")
-
-images = sorted(image_dir.glob("*.nii.gz"))
-masks = sorted(mask_dir.glob("*.nii.gz"))
-
-missing = []
-for img in images:
-    case_id = img.name[:-7]
-    candidates = [
-        mask_dir / f"{case_id}_Mask.nii.gz",
-        mask_dir / f"{case_id}.nii.gz",
-        mask_dir / f"{case_id}_mask.nii.gz",
-    ]
-    if not any(p.exists() for p in candidates):
-        missing.append(img.name)
-
-print("images:", len(images))
-print("masks:", len(masks))
-print("missing masks:", len(missing))
-if missing:
-    print("\n".join(missing[:20]))
-PY
-```
-
-理想输出：
-
-```text
-images: 106
-masks: 106
-missing masks: 0
-```
-
-再检查标签编号：
+检查 `Train-Labeled` 的标签值：
 
 ```bash
 python - <<'PY'
@@ -290,561 +258,598 @@ import SimpleITK as sitk
 import numpy as np
 
 mask_dir = Path("data/Train-Labeled/Masks")
-masks = sorted(mask_dir.glob("*.nii.gz"))
-
-global_labels = set()
-for i, p in enumerate(masks[:10], 1):
+for i, p in enumerate(sorted(mask_dir.glob("*.nii.gz"))[:10], 1):
     arr = sitk.GetArrayFromImage(sitk.ReadImage(str(p)))
-    labels = sorted(int(x) for x in np.unique(arr))
-    global_labels.update(labels)
-    print(f"{i}. {p.name}")
-    print("   labels:", labels[:80], "..." if len(labels) > 80 else "")
-
-print("sampled global min/max:", min(global_labels), max(global_labels))
+    print(i, p.name)
+    print("labels:", sorted(np.unique(arr).astype(int).tolist()))
 PY
 ```
 
-当前数据是 FDI 标签，例如：
+如果输出包含：
 
 ```text
 0, 11, 12, ..., 18, 21, ..., 28, 31, ..., 38, 41, ..., 48
 ```
 
-因此训练时明确使用：
+说明数据是 FDI 标签。后续统一使用：
 
-```bash
-export LABEL_SCHEME=fdi
+```text
+--label-scheme fdi
 ```
 
-## 9. 设置 nnU-Net 工作目录
-
-推荐把 nnU-Net 工作目录放在大容量磁盘：
+检查手工四象限伪标签：
 
 ```bash
-cd ~/STS2024Task2-nnUnet-main
+python - <<'PY'
+import SimpleITK as sitk
+import numpy as np
+from pathlib import Path
 
-export DATA_ROOT="$PWD/data"
-export NNUNET_BASE="/data1/zhkang/nnunet_work"
-
-export nnUNet_raw="$NNUNET_BASE/nnUNet_raw"
-export nnUNet_preprocessed="$NNUNET_BASE/nnUNet_preprocessed"
-export nnUNet_results="$NNUNET_BASE/nnUNet_results"
-
-mkdir -p "$nnUNet_raw" "$nnUNet_preprocessed" "$nnUNet_results"
-
-echo "DATA_ROOT=$DATA_ROOT"
-echo "nnUNet_raw=$nnUNet_raw"
-echo "nnUNet_preprocessed=$nnUNet_preprocessed"
-echo "nnUNet_results=$nnUNet_results"
+label_dir = Path("data/Manual-Pseudo-Quadrant-Labels")
+for p in sorted(label_dir.glob("*.nii.gz"))[:10]:
+    arr = sitk.GetArrayFromImage(sitk.ReadImage(str(p)))
+    labels = sorted(np.unique(arr).astype(int).tolist())
+    zero_ratio = float((arr == 0).mean())
+    print(p.name, "labels=", labels, "zero_ratio=", round(zero_ratio, 4))
+PY
 ```
 
-后续每次新开终端训练或推理，都建议重新执行这一段 `export`。
+正常应看到：
 
-为了以后不用每次手动 export，可以把这三行写入 ~/.bashrc
+```text
+labels = [0, 1, 2, 3, 4]
+zero_ratio 大约 0.99
+```
 
-cat >> ~/.bashrc <<'EOF'
-export NNUNET_BASE="/data1/zhkang/nnunet_work"
-export nnUNet_raw="$NNUNET_BASE/nnUNet_raw"
-export nnUNet_preprocessed="$NNUNET_BASE/nnUNet_preprocessed"
-export nnUNet_results="$NNUNET_BASE/nnUNet_results"
-EOF
+## 8. 数据集编号
 
-写完后当前终端执行一次：  source ~/.bashrc
+最终复现主流程使用：
 
-## 10. 生成 nnU-Net v2 数据集
+```text
+Dataset412_STS2024_QuadrantTeethLabeledV2
+  来源：新版 Train-Labeled。
+  任务：象限 crop 内牙齿实例分割。
+  配置：3d_fullres。
 
-当前数据是 FDI 标签，所以使用 `--label-scheme fdi`：
+Dataset423_STS2024_ToothQuadrantsManualPseudoV2
+  来源：新版 Train-Labeled + Manual-Pseudo-Quadrant-Labels。
+  任务：全图四象限分割。
+  配置：3d_lowres。
+```
+
+辅助对照：
+
+```text
+Dataset413_STS2024_ToothQuadrantsLabeledV2
+  只使用新版 Train-Labeled 的四象限数据集，可用于对照。
+
+Dataset443_STS2024_ToothQuadrantsAllPseudoV2
+  加入了实例伪标签转四象限后的数据，可用于对照。
+  当前实验没有优于 423，不作为最终主线。
+```
+
+## 9. 生成 Dataset412 和 Dataset413
+
+执行：
 
 ```bash
 cd ~/STS2024Task2-nnUnet-main
 
 python process/prepare_nnunetv2_datasets.py \
-  --data-root "$DATA_ROOT" \
+  --data-root data \
   --nnunet-raw "$nnUNet_raw" \
+  --quadrant-dataset-id 413 \
+  --tooth-dataset-id 412 \
+  --quadrant-dataset-name STS2024_ToothQuadrantsLabeledV2 \
+  --tooth-dataset-name STS2024_QuadrantTeethLabeledV2 \
   --label-scheme fdi \
   --overwrite
 ```
 
-这个脚本会生成：
+检查：
+
+```bash
+find "$nnUNet_raw" -maxdepth 1 -type d -name "Dataset413*"
+find "$nnUNet_raw" -maxdepth 1 -type d -name "Dataset412*"
+
+cat "$nnUNet_raw/Dataset412_STS2024_QuadrantTeethLabeledV2/dataset.json"
+
+ls "$nnUNet_raw/Dataset412_STS2024_QuadrantTeethLabeledV2/imagesTr" | wc -l
+ls "$nnUNet_raw/Dataset412_STS2024_QuadrantTeethLabeledV2/labelsTr" | wc -l
+```
+
+## 10. 生成 Dataset423
+
+执行：
+
+```bash
+python process/prepare_quadrant_pseudo_dataset.py \
+  --data-root data \
+  --nnunet-raw "$nnUNet_raw" \
+  --dataset-id 423 \
+  --dataset-name STS2024_ToothQuadrantsManualPseudoV2 \
+  --label-scheme fdi \
+  --pseudo-image-dir data/Train-Unlabeled \
+  --pseudo-label-dir data/Manual-Pseudo-Quadrant-Labels \
+  --overwrite
+```
+
+检查：
+
+```bash
+find "$nnUNet_raw" -maxdepth 1 -type d -name "Dataset423*"
+
+cat "$nnUNet_raw/Dataset423_STS2024_ToothQuadrantsManualPseudoV2/dataset.json"
+
+ls "$nnUNet_raw/Dataset423_STS2024_ToothQuadrantsManualPseudoV2/imagesTr" | wc -l
+ls "$nnUNet_raw/Dataset423_STS2024_ToothQuadrantsManualPseudoV2/labelsTr" | wc -l
+```
+
+## 11. 预处理
+
+预处理是训练前必须做的步骤。它会检查数据完整性、计算数据指纹、生成训练计划，并把数据转换成 nnU-Net v2 训练时读取的格式。
+
+执行：
+
+```bash
+mkdir -p logs
+
+nnUNetv2_plan_and_preprocess -d 423 --verify_dataset_integrity \
+  2>&1 | tee logs/preprocess_423_manual_quadrant_v2.log
+
+nnUNetv2_plan_and_preprocess -d 412 --verify_dataset_integrity \
+  2>&1 | tee logs/preprocess_412_labeled_v2.log
+```
+
+检查：
+
+```bash
+find "$nnUNet_preprocessed/Dataset423_STS2024_ToothQuadrantsManualPseudoV2" -maxdepth 2 -type d | sort
+find "$nnUNet_preprocessed/Dataset412_STS2024_QuadrantTeethLabeledV2" -maxdepth 2 -type d | sort
+```
+
+正常应能看到：
 
 ```text
-$nnUNet_raw/
-  Dataset313_STS2024_ToothQuadrants/
-    dataset.json
-    imagesTr/*_0000.nii.gz
-    labelsTr/*.nii.gz
-  Dataset312_STS2024_QuadrantTeeth/
-    dataset.json
-    imagesTr/*_0000.nii.gz
-    labelsTr/*.nii.gz
+Dataset423:
+  nnUNetPlans_2d
+  nnUNetPlans_3d_lowres
+  nnUNetPlans_3d_fullres
+
+Dataset412:
+  nnUNetPlans_2d
+  nnUNetPlans_3d_fullres
+```
+
+最终只使用：
+
+```text
+423 -> 3d_lowres
+412 -> 3d_fullres
+```
+
+## 12. 训练 Dataset423 四象限模型
+
+建议使用 tmux，避免 SSH 断开影响训练：
+
+```bash
+tmux new -s sts_train
+```
+
+五折训练：
+
+```bash
+cd ~/STS2024Task2-nnUnet-main
+mkdir -p logs
+
+CUDA_VISIBLE_DEVICES=0 nnUNetv2_train 423 3d_lowres 0 --npz \
+  2>&1 | tee logs/train_423_3d_lowres_fold0.log
+
+CUDA_VISIBLE_DEVICES=1 nnUNetv2_train 423 3d_lowres 1 --npz \
+  2>&1 | tee logs/train_423_3d_lowres_fold1.log
+
+CUDA_VISIBLE_DEVICES=2 nnUNetv2_train 423 3d_lowres 2 --npz \
+  2>&1 | tee logs/train_423_3d_lowres_fold2.log
+
+CUDA_VISIBLE_DEVICES=3 nnUNetv2_train 423 3d_lowres 3 --npz \
+  2>&1 | tee logs/train_423_3d_lowres_fold3.log
+
+CUDA_VISIBLE_DEVICES=4 nnUNetv2_train 423 3d_lowres 4 --npz \
+  2>&1 | tee logs/train_423_3d_lowres_fold4.log
+```
+
+当前实验结果：
+
+```text
+fold0: 0.7766
+fold1: 0.8845
+fold2: 0.8109
+fold3: 0.8117
+fold4: 0.7653
+mean: 0.8096
+```
+
+说明：四象限任务更依赖全局上下左右信息，`3d_lowres` 比 `3d_fullres` 更适合作为主模型。
+
+## 13. 训练 Dataset412 牙齿实例模型
+
+五折训练：
+
+```bash
+cd ~/STS2024Task2-nnUnet-main
+mkdir -p logs
+
+CUDA_VISIBLE_DEVICES=0 nnUNetv2_train 412 3d_fullres 0 --npz \
+  2>&1 | tee logs/train_412_3d_fullres_fold0.log
+
+CUDA_VISIBLE_DEVICES=1 nnUNetv2_train 412 3d_fullres 1 --npz \
+  2>&1 | tee logs/train_412_3d_fullres_fold1.log
+
+CUDA_VISIBLE_DEVICES=2 nnUNetv2_train 412 3d_fullres 2 --npz \
+  2>&1 | tee logs/train_412_3d_fullres_fold2.log
+
+CUDA_VISIBLE_DEVICES=3 nnUNetv2_train 412 3d_fullres 3 --npz \
+  2>&1 | tee logs/train_412_3d_fullres_fold3.log
+
+CUDA_VISIBLE_DEVICES=4 nnUNetv2_train 412 3d_fullres 4 --npz \
+  2>&1 | tee logs/train_412_3d_fullres_fold4.log
+```
+
+当前实验结果：
+
+```text
+fold0: 0.8744
+fold1: 0.9008
+fold2: 0.8677
+fold3: 0.9267
+fold4: 0.9133
+mean: 0.8966
+```
+
+## 14. 汇总训练指标
+
+```bash
+for f in 0 1 2 3 4; do
+  echo "423 fold$f"
+  grep -h "Mean Validation Dice" logs/train_423_3d_lowres_fold${f}.log | tail -1
+done
+
+for f in 0 1 2 3 4; do
+  echo "412 fold$f"
+  grep -h "Mean Validation Dice" logs/train_412_3d_fullres_fold${f}.log | tail -1
+done
+```
+
+检查 checkpoint：
+
+```bash
+find "$nnUNet_results" -path "*Dataset423*" -name "checkpoint_final.pth" | sort
+find "$nnUNet_results" -path "*Dataset412*" -name "checkpoint_final.pth" | sort
+find "$nnUNet_results" -path "*Dataset423*" -name "checkpoint_best.pth" | sort
+find "$nnUNet_results" -path "*Dataset412*" -name "checkpoint_best.pth" | sort
+```
+
+## 15. 推理 Validation-Public
+
+`Validation-Public` 没有金标准，所以只做可视化检查，不计算 Dice/HD95。
+
+推理：
+
+```bash
+cd ~/STS2024Task2-nnUnet-main
+mkdir -p logs
+
+export QUADRANT_DATASET_ID=423
+export TOOTH_DATASET_ID=412
+export QUADRANT_CONFIG=3d_lowres
+export TOOTH_CONFIG=3d_fullres
+export FOLD="0 1 2 3 4"
+export QUADRANT_CHECKPOINT=checkpoint_final.pth
+export TOOTH_CHECKPOINT=checkpoint_final.pth
+export OUTPUT_LABEL_SCHEME=fdi
+export DISABLE_TTA=0
+
+CUDA_VISIBLE_DEVICES=3 bash scripts/predict_v2.sh \
+  data/Validation-Public \
+  runs/val_pred_423_412_final_tta \
+  2>&1 | tee logs/predict_val_423_412_final_tta.log
+```
+
+输出：
+
+```text
+runs/val_pred_423_412_final_tta/final
 ```
 
 检查数量：
 
 ```bash
-echo "Dataset313 images:"
-find "$nnUNet_raw/Dataset313_STS2024_ToothQuadrants/imagesTr" -name "*.nii.gz" | wc -l
-
-echo "Dataset313 labels:"
-find "$nnUNet_raw/Dataset313_STS2024_ToothQuadrants/labelsTr" -name "*.nii.gz" | wc -l
-
-echo "Dataset312 images:"
-find "$nnUNet_raw/Dataset312_STS2024_QuadrantTeeth/imagesTr" -name "*.nii.gz" | wc -l
-
-echo "Dataset312 labels:"
-find "$nnUNet_raw/Dataset312_STS2024_QuadrantTeeth/labelsTr" -name "*.nii.gz" | wc -l
+find runs/val_pred_423_412_final_tta/final -name "*.nii.gz" | wc -l
 ```
 
-当前数据示例结果：
+## 16. 推理有金标准测试集
+
+测试集目录：
 
 ```text
-Dataset313 images: 106
-Dataset313 labels: 106
-Dataset312 images: 422
-Dataset312 labels: 422
+data/dental_CBCT_test_set/images
+data/dental_CBCT_test_set/labels
 ```
 
-`Dataset312` 不一定正好是 `106 * 4 = 424`，因为有些病例可能缺牙或某些象限为空。
-
-查看 `dataset.json`：
-
-```bash
-cat "$nnUNet_raw/Dataset313_STS2024_ToothQuadrants/dataset.json"
-cat "$nnUNet_raw/Dataset312_STS2024_QuadrantTeeth/dataset.json"
-```
-
-## 11. 重要说明：mask spacing mismatch
-
-如果预处理时报：
-
-```text
-Error: Spacing mismatch between segmentation and corresponding images.
-Spacing images: 0.2, 0.2, 0.2
-Spacing seg: 1.0, 1.0, 1.0
-```
-
-说明原始 mask 的 NIfTI 文件头信息不正确。当前代码已经修复：生成 nnU-Net label 时会继承对应 image 的 spacing/origin/direction，而不是继承原始 mask 的错误信息。
-
-可以用下面命令检查一个病例：
-
-```bash
-python - <<'PY'
-import SimpleITK as sitk
-from pathlib import Path
-
-case = "STS24_Train_X2313838"
-raw = Path("/data1/zhkang/nnunet_work/nnUNet_raw/Dataset313_STS2024_ToothQuadrants")
-
-img = sitk.ReadImage(str(raw / "imagesTr" / f"{case}_0000.nii.gz"))
-seg = sitk.ReadImage(str(raw / "labelsTr" / f"{case}.nii.gz"))
-
-print("image spacing:", img.GetSpacing())
-print("seg spacing:  ", seg.GetSpacing())
-print("image origin:", img.GetOrigin())
-print("seg origin:  ", seg.GetOrigin())
-print("image size:", img.GetSize())
-print("seg size:  ", seg.GetSize())
-PY
-```
-
-理想情况是 image 和 seg 的 spacing、origin、size 都一致。
-
-## 12. nnU-Net v2 预处理
-
-建议把输出保存到日志：
+推理 `checkpoint_final.pth + TTA`：
 
 ```bash
 cd ~/STS2024Task2-nnUnet-main
 mkdir -p logs
 
-nnUNetv2_plan_and_preprocess -d 313 --verify_dataset_integrity \
-  2>&1 | tee logs/preprocess_313.log
-
-nnUNetv2_plan_and_preprocess -d 312 --verify_dataset_integrity \
-  2>&1 | tee logs/preprocess_312.log
-```
-
-检查预处理结果：
-
-```bash
-find "$nnUNet_preprocessed/Dataset313_STS2024_ToothQuadrants" -maxdepth 2 -type d | sort
-find "$nnUNet_preprocessed/Dataset312_STS2024_QuadrantTeeth" -maxdepth 2 -type d | sort
-```
-
-当前数据已验证的 planner 结果：
-
-```text
-Dataset313_STS2024_ToothQuadrants:
-  nnUNetPlans_2d
-  nnUNetPlans_3d_fullres
-  nnUNetPlans_3d_lowres
-
-Dataset312_STS2024_QuadrantTeeth:
-  nnUNetPlans_2d
-  nnUNetPlans_3d_fullres
-```
-
-因此推荐训练配置：
-
-```bash
-Dataset313: 3d_lowres
-Dataset312: 3d_fullres
-```
-
-## 13. 使用 tmux 防止训练中断
-
-训练时间很长，强烈建议使用 `tmux`，避免 SSH 断开导致训练停止。
-
-检查 tmux：
-
-```bash
-tmux -V
-```
-
-新建训练会话：
-
-```bash
-tmux new -s sts_train
-```
-
-在 tmux 中启动训练后，如需退出但保持训练继续：
-
-```text
-Ctrl+b
-松开
-d
-```
-
-重新进入：
-
-```bash
-tmux attach -t sts_train
-```
-
-查看日志：
-
-```bash
-tail -f logs/train_313_3d_lowres_fold0.log
-```
-
-查看 GPU：
-
-```bash
-nvidia-smi
-```
-
-## 14. 训练策略
-
-nnU-Net v2 默认训练约 `1000 epochs`。当前阶段建议：
-
-```text
-先训练 fold 0，完整跑通两阶段流程。
-不要一开始就训练 all 或 5 折。
-```
-
-推荐顺序：
-
-```text
-1. 训练 Dataset313 3d_lowres fold 0
-2. 训练 Dataset312 3d_fullres fold 0
-3. 用两个 fold 0 模型跑 Validation-Public 推理
-4. 确认结果正常后，再考虑 all、5 折或半监督迭代
-```
-
-训练中如果看到 PyTorch 的 warning，例如：
-
-```text
-torch/fx/experimental/symbolic_shapes.py
-unknown range
-```
-
-一般不是错误。只要没有 `Traceback`、`RuntimeError`、`CUDA out of memory`、`loss nan`，就先让训练继续。
-
-如果下一次想减少 `torch.compile` 相关 warning，可以在训练前设置：
-
-```bash
-export nnUNet_compile=f
-```
-
-## 15. 训练 Dataset313 象限模型
-
-在 tmux 中执行：
-
-```bash
-cd ~/STS2024Task2-nnUnet-main
-
-export NNUNET_BASE="/data1/zhkang/nnunet_work"
-export nnUNet_raw="$NNUNET_BASE/nnUNet_raw"
-export nnUNet_preprocessed="$NNUNET_BASE/nnUNet_preprocessed"
-export nnUNet_results="$NNUNET_BASE/nnUNet_results"
-
-mkdir -p logs
-
-CUDA_VISIBLE_DEVICES=0 nnUNetv2_train 313 3d_lowres 0 --npz \
-  2>&1 | tee logs/train_313_3d_lowres_fold0.log
-```
-
-正常启动时会看到类似：
-
-```text
-Creating new 5-fold cross-validation split...
-Desired fold for training: 0
-This split has 84 training and 22 validation cases.
-using pin_memory on device 0
-```
-
-训练完成后检查 checkpoint：
-
-```bash
-find "$nnUNet_results" -path "*Dataset313*" -name "checkpoint_final.pth"
-find "$nnUNet_results" -path "*Dataset313*" -name "checkpoint_best.pth"
-```
-
-## 16. 训练 Dataset312 牙齿模型
-
-`Dataset313` 完成后，再训练第二阶段模型：
-
-```bash
-cd ~/STS2024Task2-nnUnet-main
-
-export NNUNET_BASE="/data1/zhkang/nnunet_work"
-export nnUNet_raw="$NNUNET_BASE/nnUNet_raw"
-export nnUNet_preprocessed="$NNUNET_BASE/nnUNet_preprocessed"
-export nnUNet_results="$NNUNET_BASE/nnUNet_results"
-
-mkdir -p logs
-
-CUDA_VISIBLE_DEVICES=0 nnUNetv2_train 312 3d_fullres 0 --npz \
-  2>&1 | tee logs/train_312_3d_fullres_fold0.log
-```
-
-完成后检查：
-
-```bash
-find "$nnUNet_results" -path "*Dataset312*" -name "checkpoint_final.pth"
-find "$nnUNet_results" -path "*Dataset312*" -name "checkpoint_best.pth"
-```
-
-## 17. 两阶段验证集推理
-
-如果你训练的是 fold 0，推理时必须设置：
-
-```bash
-export FOLD=0
-```
-
-验证集推理：
-
-```bash
-cd ~/STS2024Task2-nnUnet-main
-
-export NNUNET_BASE="/data1/zhkang/nnunet_work"
-export nnUNet_raw="$NNUNET_BASE/nnUNet_raw"
-export nnUNet_preprocessed="$NNUNET_BASE/nnUNet_preprocessed"
-export nnUNet_results="$NNUNET_BASE/nnUNet_results"
-
-export QUADRANT_DATASET_ID=313
-export TOOTH_DATASET_ID=312
+export QUADRANT_DATASET_ID=423
+export TOOTH_DATASET_ID=412
 export QUADRANT_CONFIG=3d_lowres
 export TOOTH_CONFIG=3d_fullres
-export FOLD=0
+export FOLD="0 1 2 3 4"
 export QUADRANT_CHECKPOINT=checkpoint_final.pth
 export TOOTH_CHECKPOINT=checkpoint_final.pth
 export OUTPUT_LABEL_SCHEME=fdi
-export DISABLE_TTA=1
+export DISABLE_TTA=0
 
-bash scripts/predict_v2.sh data/Validation-Public runs/val_pred_fold0
+CUDA_VISIBLE_DEVICES=2 bash scripts/predict_v2.sh \
+  data/dental_CBCT_test_set/images \
+  runs/test_pred_423_412_final_tta \
+  2>&1 | tee logs/predict_test_423_412_final_tta.log
 ```
 
-最终结果：
-
-```text
-runs/val_pred_fold0/final/*_Mask.nii.gz
-```
-
-推理目录结构：
-
-```text
-runs/val_pred_fold0/
-  nnunet_inputs/
-  quadrant_predictions/
-  quadrant_resizer/
-  quadrant_cropped_inputs/
-  tooth_predictions/
-  final/
-```
-
-## 18. 后续正式训练建议
-
-fold 0 跑通后，可以选择：
-
-```text
-方案 A：继续训练 fold 1-4，做更完整的交叉验证。
-方案 B：训练 fold all，用全部有标签数据训练最终模型。
-方案 C：先用 fold 0 teacher 生成伪标签，跑一轮 student，验证半监督流程。
-```
-
-训练 `all` 示例：
+推理 `checkpoint_best.pth + TTA`：
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 nnUNetv2_train 313 3d_lowres all --npz \
-  2>&1 | tee logs/train_313_3d_lowres_all.log
+export QUADRANT_CHECKPOINT=checkpoint_best.pth
+export TOOTH_CHECKPOINT=checkpoint_best.pth
+export DISABLE_TTA=0
 
-CUDA_VISIBLE_DEVICES=0 nnUNetv2_train 312 3d_fullres all --npz \
-  2>&1 | tee logs/train_312_3d_fullres_all.log
+CUDA_VISIBLE_DEVICES=3 bash scripts/predict_v2.sh \
+  data/dental_CBCT_test_set/images \
+  runs/test_pred_423_412_best_tta \
+  2>&1 | tee logs/predict_test_423_412_best_tta.log
 ```
 
-如果使用 `all` 模型推理：
+检查预测数量：
 
 ```bash
-export FOLD=all
+find runs/test_pred_423_412_final_tta/final -name "*.nii.gz" | wc -l
+find runs/test_pred_423_412_best_tta/final -name "*.nii.gz" | wc -l
+find data/dental_CBCT_test_set/labels -name "*.nii.gz" | wc -l
 ```
 
-## 19. 半监督伪标签迭代
+## 17. 计算测试集 Dice 和 HD95
 
-无标签数据目录：
-
-```text
-data/Train-Unlabeled
-```
-
-当前服务器示例数量：
-
-```text
-300
-```
-
-一次 teacher -> pseudo label -> student 迭代：
+评价 `final_tta`：
 
 ```bash
-cd ~/STS2024Task2-nnUnet-main
+python process/evaluate_segmentation_metrics.py \
+  --pred-dir runs/test_pred_423_412_final_tta/final \
+  --gt-dir data/dental_CBCT_test_set/labels \
+  --output-csv runs/eval_test_423_412_final_tta/per_case_metrics.csv \
+  --summary-csv runs/eval_test_423_412_final_tta/summary_metrics.csv \
+  --label-mode fdi
+```
 
-export NNUNET_BASE="/data1/zhkang/nnunet_work"
-export nnUNet_raw="$NNUNET_BASE/nnUNet_raw"
-export nnUNet_preprocessed="$NNUNET_BASE/nnUNet_preprocessed"
-export nnUNet_results="$NNUNET_BASE/nnUNet_results"
+查看结果：
 
-export LABEL_SCHEME=fdi
-export PSEUDO_OUTPUT_LABEL_SCHEME=fdi
-export TEACHER_QUADRANT_DATASET_ID=313
-export TEACHER_TOOTH_DATASET_ID=312
-export STUDENT_QUADRANT_DATASET_ID=323
-export STUDENT_TOOTH_DATASET_ID=322
+```bash
+cat runs/eval_test_423_412_final_tta/summary_metrics.csv
+```
+
+当前结果：
+
+```text
+scope,label,n,mean_dice,mean_hd95_mm
+all_teeth,mean,1514,0.9562,0.5754
+foreground,foreground,50,0.9684,0.2645
+```
+
+评价 `best_tta`：
+
+```bash
+python process/evaluate_segmentation_metrics.py \
+  --pred-dir runs/test_pred_423_412_best_tta/final \
+  --gt-dir data/dental_CBCT_test_set/labels \
+  --output-csv runs/eval_test_423_412_best_tta/per_case_metrics.csv \
+  --summary-csv runs/eval_test_423_412_best_tta/summary_metrics.csv \
+  --label-mode fdi
+```
+
+当前结果：
+
+```text
+scope,label,n,mean_dice,mean_hd95_mm
+all_teeth,mean,1514,0.9246523388145589,1.549844420393415
+foreground,foreground,50,0.9677140146969152,0.26863960921764374
+```
+
+评价指标解释：
+
+```text
+all_teeth
+  逐牙标签分别计算 Dice/HD95 后求平均，更适合作为实例分割主指标。
+
+foreground
+  把所有牙齿标签合并成一个前景后计算 Dice/HD95，更适合反映整体牙齿区域分割质量。
+```
+
+论文主结果建议使用 `final_tta`。
+
+## 18. 历史预测结果的 FDI 编号修正
+
+当前版本的 `pipeline/quadrant_merge.py` 已经输出标准 FDI：
+
+```text
+1 -> 11-18
+2 -> 21-28
+3 -> 31-38
+4 -> 41-48
+```
+
+如果你是用当前版本重新推理测试集，不需要执行本节。
+
+如果你已经用早期版本生成了预测，可能出现：
+
+```text
+foreground Dice 很高
+all_teeth Dice 接近 0
+```
+
+这通常说明空间分割正确，但 FDI 左右象限编号交换。可用下面命令修正旧预测：
+
+```bash
+python process/remap_legacy_fdi_quadrants.py \
+  --input-dir runs/test_pred_423_412_final_tta/final \
+  --output-dir runs/test_pred_423_412_final_tta/final_fdi_standard \
+  --overwrite
+```
+
+然后评价修正后的目录：
+
+```bash
+python process/evaluate_segmentation_metrics.py \
+  --pred-dir runs/test_pred_423_412_final_tta/final_fdi_standard \
+  --gt-dir data/dental_CBCT_test_set/labels \
+  --output-csv runs/eval_test_423_412_final_tta_fixed/per_case_metrics.csv \
+  --summary-csv runs/eval_test_423_412_final_tta_fixed/summary_metrics.csv \
+  --label-mode fdi
+```
+
+## 19. 推理 Train-Unlabeled 生成伪标签
+
+如果要继续做半监督迭代，可对 `Train-Unlabeled` 推理。
+
+推荐分别跑 `final_tta` 和 `best_tta`，再做一致性筛选。
+
+推理 final：
+
+```bash
+export QUADRANT_DATASET_ID=423
+export TOOTH_DATASET_ID=412
 export QUADRANT_CONFIG=3d_lowres
 export TOOTH_CONFIG=3d_fullres
-export FOLD=0
-export CHECKPOINTS="checkpoint_best.pth checkpoint_final.pth"
-export PSEUDO_THRESHOLD=0.90
-export PSEUDO_TOP_K=30
+export FOLD="0 1 2 3 4"
+export QUADRANT_CHECKPOINT=checkpoint_final.pth
+export TOOTH_CHECKPOINT=checkpoint_final.pth
+export OUTPUT_LABEL_SCHEME=fdi
+export DISABLE_TTA=0
 
-bash scripts/pseudo_iteration_v2.sh
+CUDA_VISIBLE_DEVICES=4 bash scripts/predict_v2.sh \
+  data/Train-Unlabeled \
+  runs/pseudo_teacher_423_412_final_tta \
+  2>&1 | tee logs/predict_unlabeled_423_412_final_tta.log
 ```
 
-该脚本会：
+推理 best：
 
-1. 用 teacher 对 `data/Train-Unlabeled` 做两阶段推理。
-2. 对多个 checkpoint 的预测结果计算 pairwise multi-class Dice。
-3. 把一致性 Dice 高于阈值的伪标签复制到 `runs/pseudo_iter1/selected_pseudo_labels/`。
-4. 用原始标注数据 + 选中的伪标签生成学生数据集。
-5. 训练学生象限模型和学生牙齿模型。
+```bash
+export QUADRANT_CHECKPOINT=checkpoint_best.pth
+export TOOTH_CHECKPOINT=checkpoint_best.pth
+export DISABLE_TTA=0
 
-筛选报告：
+CUDA_VISIBLE_DEVICES=5 bash scripts/predict_v2.sh \
+  data/Train-Unlabeled \
+  runs/pseudo_teacher_423_412_best_tta \
+  2>&1 | tee logs/predict_unlabeled_423_412_best_tta.log
+```
+
+一致性筛选：
+
+```bash
+python process/select_pseudo_dice.py \
+  --prediction-dirs \
+    runs/pseudo_teacher_423_412_best_tta/final \
+    runs/pseudo_teacher_423_412_final_tta/final \
+  --output-dir runs/pseudo_selected_423_412_tta_thr095 \
+  --threshold 0.95 \
+  --report-csv runs/pseudo_selected_423_412_tta_thr095_report.csv
+```
+
+检查筛选数量：
+
+```bash
+find runs/pseudo_selected_423_412_tta_thr095 -name "*.nii.gz" | wc -l
+```
+
+筛出的伪标签仍建议用 3D Slicer 人工检查，删除明显错误病例后再进入下一轮训练。
+
+## 20. 论文可视化
+
+推荐使用有金标准的测试集：
 
 ```text
-runs/pseudo_iter1/pseudo_selection.csv
+data/dental_CBCT_test_set/images
+data/dental_CBCT_test_set/labels
+runs/test_pred_423_412_final_tta/final
 ```
 
-第二轮伪标签迭代可改成：
+推荐展示方式：
 
-```bash
-export TEACHER_QUADRANT_DATASET_ID=323
-export TEACHER_TOOTH_DATASET_ID=322
-export STUDENT_QUADRANT_DATASET_ID=333
-export STUDENT_TOOTH_DATASET_ID=332
-export PSEUDO_WORK_DIR=runs/pseudo_iter2
-
-bash scripts/pseudo_iteration_v2.sh
+```text
+CT 原图
+Ground Truth overlay
+Prediction overlay
+3D surface
 ```
 
-## 20. 常用监控命令
+建议选择：
 
-查看 GPU：
-
-```bash
-nvidia-smi
+```text
+2-3 个效果好的病例
+1 个中等难度病例
+1 个失败或困难病例
 ```
 
-实时看训练日志：
+3D Slicer 5.8.1 可用于制作可视化图：
 
-```bash
-tail -f logs/train_313_3d_lowres_fold0.log
-tail -f logs/train_312_3d_fullres_fold0.log
+```text
+1. 加载 CBCT 图像。
+2. 加载 GT label。
+3. 加载 prediction label。
+4. 转为 Segmentation。
+5. 开启 3D 显示。
+6. 调整颜色、透明度和视角。
+7. 截图保存。
 ```
 
-看最近 50 行：
+`Validation-Public` 没有金标准，只能展示预测结果，不能作为论文定量指标。
 
-```bash
-tail -n 50 logs/train_313_3d_lowres_fold0.log
+## 21. 最终论文结果记录模板
+
+```text
+Method:
+Two-stage nnU-Net v2 pipeline.
+Stage 1: Dataset423, 3d_lowres, 5-fold ensemble.
+Stage 2: Dataset412, 3d_fullres, 5-fold ensemble.
+Inference: checkpoint_final.pth, TTA enabled.
+
+Test set:
+50 labeled dental CBCT scans.
+
+Metrics:
+Instance-level mean Dice: 0.9562
+Instance-level mean HD95: 0.5754 mm
+Foreground Dice: 0.9684
+Foreground HD95: 0.2645 mm
 ```
 
-查 checkpoint：
+## 22. 复现顺序总览
 
-```bash
-find /data1/zhkang/nnunet_work/nnUNet_results -name "checkpoint_final.pth"
-find /data1/zhkang/nnunet_work/nnUNet_results -name "checkpoint_best.pth"
+```text
+1. 安装 Miniconda。
+2. 创建 nnunetv2 环境。
+3. 安装 PyTorch 和 requirements-linux.txt。
+4. 固定 nnU-Net v2 环境变量。
+5. 检查 data 目录和标签值。
+6. 生成 Dataset412 和 Dataset413。
+7. 生成 Dataset423。
+8. 预处理 Dataset423 和 Dataset412。
+9. 训练 Dataset423 3d_lowres 五折。
+10. 训练 Dataset412 3d_fullres 五折。
+11. 使用 423 + 412 推理 dental_CBCT_test_set。
+12. 计算 Dice 和 HD95。
+13. 使用 3D Slicer 制作论文可视化。
+14. 如需继续半监督迭代，再推理 Train-Unlabeled 并筛选伪标签。
 ```
-
-查预处理目录：
-
-```bash
-find /data1/zhkang/nnunet_work/nnUNet_preprocessed -maxdepth 2 -type d | sort
-```
-
-## 21. 文件说明
-
-- `process/prepare_nnunetv2_datasets.py`：生成 nnU-Net v2 raw datasets，是训练入口的核心数据转换脚本。
-- `process/prepare_inference_inputs.py`：把普通 NIfTI 目录复制成 nnU-Net v2 推理输入命名 `*_0000.nii.gz`。
-- `process/FDI2Qua.py`：单独把实例牙齿标签转成象限标签。
-- `process/preparefor2.py`：单独生成第二阶段象限 crop 图像和标签。
-- `process/select_pseudo_dice.py`：基于多 checkpoint 预测一致性 Dice 筛选伪标签。
-- `pipeline/quadrant_locate.py`：根据阶段 1 象限预测裁剪阶段 2 ROI。
-- `pipeline/quadrant_merge.py`：将阶段 2 象限内牙齿预测合并回原图。
-- `pipeline/postprocess_small_components.py`：按每个标签的连通域移除小组件。
-- `pipeline/predict.sh`：兼容入口，实际调用 `scripts/predict_v2.sh`。
-- `scripts/train_v2_supervised.sh`：监督训练入口，默认会训练 `all`，新手建议先手动按本文档训练 `fold 0`。
-- `scripts/predict_v2.sh`：两阶段推理入口。
-- `scripts/pseudo_iteration_v2.sh`：半监督伪标签迭代入口。
-
-## 22. 常见问题
-
-如果 `nnUNetv2_train 313 3d_lowres ...` 报配置不存在，说明 planner 没有为该数据集生成 `3d_lowres`，把 `QUADRANT_CONFIG` 改成 `3d_fullres`。
-
-如果伪标签训练时标签不对，优先检查 `LABEL_SCHEME` 和 `PSEUDO_OUTPUT_LABEL_SCHEME` 是否一致。当前数据是 FDI 标签，所以推荐都设置为 `fdi`。
-
-如果推理结果要提交评测，通常使用 `OUTPUT_LABEL_SCHEME=fdi`。
-
-如果推理结果要进入下一轮训练，使用：
-
-```bash
-export OUTPUT_LABEL_SCHEME="$LABEL_SCHEME"
-```
-
-如果训练中出现 `CUDA out of memory`，先确认是否只使用了一个 GPU：
-
-```bash
-echo $CUDA_VISIBLE_DEVICES
-```
-
-也可以换一张空闲 GPU：
-
-```bash
-CUDA_VISIBLE_DEVICES=1 nnUNetv2_train 313 3d_lowres 0 --npz
-```
-
-如果 SSH 断开导致训练中断，说明没有使用 tmux 或 nohup。以后训练前先进入：
-
-```bash
-tmux new -s sts_train
-```
-
-如果训练过程中只有 warning，没有 `Traceback` 或 `RuntimeError`，通常先不要中断，让它继续跑。

@@ -10,11 +10,11 @@ import numpy as np
 import SimpleITK as sitk
 
 
-FDI_STS_MAPPING = {
-    1: list(range(21, 29)),
-    2: list(range(11, 19)),
-    3: list(range(41, 49)),
-    4: list(range(31, 39)),
+FDI_MAPPING = {
+    1: list(range(11, 19)),
+    2: list(range(21, 29)),
+    3: list(range(31, 39)),
+    4: list(range(41, 49)),
 }
 
 SEQUENTIAL_MAPPING = {
@@ -56,7 +56,7 @@ def adjust_size(source_array: np.ndarray, target_shape: tuple[int, ...]) -> np.n
 
 def label_mapping(output_label_scheme: str) -> dict[int, list[int]]:
     if output_label_scheme == "fdi":
-        return FDI_STS_MAPPING
+        return FDI_MAPPING
     if output_label_scheme == "sequential":
         return SEQUENTIAL_MAPPING
     raise ValueError(f"Unsupported output label scheme: {output_label_scheme}")
